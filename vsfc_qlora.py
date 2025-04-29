@@ -128,16 +128,26 @@ def get_lora_config(model_name: str, r: int, alpha: int, dropout: float):
 
 
 class QLoRA4VSA(L.LightningModule):
-    def __init__(self, model_name, num_labels, lr):
+    def __init__(
+        self,
+        model_name: str,
+        num_labels: int,
+        lora_rank: int,
+        lora_alpha: int,
+        lora_dropout: float,
+        lr: float
+    ):
         super().__init__()
+        # Save all hyperparameters including LoRA settings
         self.save_hyperparameters()
-        # 1. Load with 4bit quant config
+
+        # Load base model with 4-bit quantization
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_name,
             num_labels=num_labels,
             quantization_config=get_4bit_config()
         )
-        # 2. Prepare for k-bit and apply LoRA
+        # Prepare for k-bit training and apply LoRA
         self.model = prepare_model_for_kbit_training(self.model)
         self.model = get_peft_model(
             self.model,
@@ -148,6 +158,7 @@ class QLoRA4VSA(L.LightningModule):
                 self.hparams.lora_dropout
             )
         )
+
         # Metrics
         self.train_acc = Accuracy(task="multiclass", num_classes=num_labels)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_labels)
@@ -208,13 +219,16 @@ class QLoRA4VSA(L.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.AdamW(
-            self.model.parameters(), lr=self.hparams.learning_rate, weight_decay=0.01
+            self.model.parameters(),
+            lr=self.hparams.learning_rate,
+            weight_decay=0.01
         )
 
 
 if __name__ == '__main__':
     args = qlora_parse_args()
-    # Map model choice to name
+
+    # Map choice to pretrained model name
     model_map = {
         1: "vinai/phobert-base-v2",
         2: "vinai/phobert-large",
@@ -223,7 +237,7 @@ if __name__ == '__main__':
     }
     model_name = model_map[args.model]
 
-    # Set seeds
+    # Set random seeds
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
@@ -247,29 +261,31 @@ if __name__ == '__main__':
         val_loader   = loader.load_data('val')
         test_loader  = loader.load_data('test')
 
-    # Model init
+    # Initialize model with LoRA hyperparameters
     model = QLoRA4VSA(
         model_name=model_name,
         num_labels=3,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
         lr=args.learning_rate
     )
 
-    # Trainer
+    # Trainer setup
     GPUs = [int(g) for g in args.gpus.split(',')]
-    callbacks = [EarlyStopping(monitor='val_loss', patience=3)]
     trainer = L.Trainer(
         max_epochs=args.epochs,
         accelerator='gpu',
         devices=GPUs,
-        callbacks=callbacks,
-        precision="bf16-mixed"
+        callbacks=[EarlyStopping(monitor='val_loss', patience=3)],
+        precision='bf16-mixed'
     )
 
-    # Train
+    # Training
     start_time = time.time()
     trainer.fit(model, train_loader, val_loader)
     if trainer.is_global_zero:
         print(f"Training time: {time.time() - start_time:.2f} seconds")
 
-    # Test
+    # Testing
     trainer.test(model, test_loader)
