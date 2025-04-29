@@ -158,17 +158,17 @@ class QLoRA4VSA(L.LightningModule):
         return {'test_acc': self.test_acc, 'test_f1': self.test_f1}
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.model.parameters(), lr=self.hparams.learning_rate, weight_decay=0.01)
+        # Use the saved 'lr' hyperparameter instead of non-existent 'learning_rate'
+        return torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.hparams.lr,
+            weight_decay=0.01
+        )
 
 
 if __name__ == '__main__':
     args = lora_parse_args()
-    model_map = {
-        1: "vinai/phobert-base-v2",
-        2: "vinai/phobert-large",
-        3: "vinai/bartpho-word",
-        4: "VietAI/vit5-large"}
-
+    model_map = {1: "vinai/phobert-base-v2", 2: "vinai/phobert-large", 3: "vinai/bartpho-word", 4: "VietAI/vit5-large"}
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(model_map[args.model])
