@@ -1,5 +1,5 @@
-import time
 import argparse
+import time
 import torch
 import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping
@@ -7,7 +7,9 @@ from transformers import AutoTokenizer
 from adapters import AutoAdapterModel, SeqBnConfig
 from torchmetrics import Accuracy, F1Score
 import GPUtil
-from mint.uit_vsfc_helpers import VSFCLoader
+from mint.uit_vsfc_helpers import VSFCLoader, load_aivivn, AIVIVNDataset, AIVIVNLoader
+from underthesea import word_tokenize
+from torch.utils.data import random_split, DataLoader
 
 torch.set_float32_matmul_precision('high')
 
@@ -18,11 +20,18 @@ def adapter_parse_args():
         description="Adapter Fine-tuning for Vietnamese Sentiment Analysis"
     )
     parser.add_argument(
-        "--model", 
+        "--model",
         type=int,
         choices=[1, 2],
         required=True,
         help="Model selection: 1=PhoBERT-base-v2, 2=PhoBERT-large"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=['uit', 'aivi'],
+        default='uit',
+        help="Dataset to use: 'uit' for UIT-VSFC, 'aivi' for AIVIVN-2019"
     )
     parser.add_argument(
         "--adapter_size",
@@ -32,7 +41,7 @@ def adapter_parse_args():
     )
     parser.add_argument(
         "--batch_size",
-        type=int, 
+        type=int,
         default=32,
         help="Batch size (default: 32)"
     )
@@ -46,7 +55,7 @@ def adapter_parse_args():
         "--gpus",
         type=str,
         default="0",
-        help="Comma-separated list of GPU indices to use, e.g., '0,1,2' (default: '0')"
+        help="Comma-separated list of GPU indices to use"
     )
     parser.add_argument(
         "--learning_rate",
@@ -55,7 +64,7 @@ def adapter_parse_args():
         help="Learning rate (default: 2e-5)"
     )
     parser.add_argument(
-        "--seed", 
+        "--seed",
         type=int,
         default=42,
         help="Random seed (default: 42)"
@@ -65,30 +74,23 @@ def adapter_parse_args():
 
 class Adapter4VSA(L.LightningModule):
     """
-       Adapter fine-tuning BERT model for Vietnamese Sentiment Analysis (VSA)
+       Adapter fine-tuning for PhoBERT models
     """
     def __init__(self, model_name, num_labels, adapter_size=16, lr=2e-5):
         super().__init__()
         self.save_hyperparameters()
-        
-        # Load pre-trained model with adapter support
+        # Load base adapter model
         self.model = AutoAdapterModel.from_pretrained(model_name)
 
-        # Set adapter size and reduction factor
+        # Compute reduction factor
         hidden_size = self.model.config.hidden_size
         reduction_factor = hidden_size // adapter_size
+        if hidden_size % adapter_size != 0 or reduction_factor < 1:
+            raise ValueError(
+                f"Adapter size {adapter_size} must divide hidden size {hidden_size}."
+            )
 
-        # Check if hidden size is divisible by adapter size
-        if hidden_size % adapter_size != 0:
-            raise ValueError(
-                f"Hidden size {hidden_size} must be divisible by adapter size {adapter_size}."
-            )
-        if reduction_factor < 1:
-            raise ValueError(
-                f"Reduction factor {reduction_factor} must be at least 1."
-            )
-        
-        # Add adapter configuration
+        # Configure and add adapter
         config = SeqBnConfig(
             mh_adapter=True,
             output_adapter=True,
@@ -98,13 +100,13 @@ class Adapter4VSA(L.LightningModule):
         )
         self.model.add_adapter("vsbc_adapter", config=config)
         self.model.train_adapter("vsbc_adapter")
-        
+
         # Classification head
         self.classifier = torch.nn.Linear(
-            self.model.config.hidden_size, 
+            self.model.config.hidden_size,
             num_labels
         )
-        
+
         # Metrics
         self.train_acc = Accuracy(task="multiclass", num_classes=num_labels)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_labels)
@@ -114,42 +116,28 @@ class Adapter4VSA(L.LightningModule):
 
     def forward(self, input_ids, attention_mask):
         outputs = self.model(
-            input_ids, 
+            input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,   
-        )
-        last_hidden_state = outputs.hidden_states[-1]
-        pooled_output = last_hidden_state[:, 0, :]
-        return self.classifier(pooled_output)
-
-    def training_step(self, batch, batch_idx):
-        outputs = self.model(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
             output_hidden_states=True
         )
-        logits = self.classifier(outputs.hidden_states[-1][:, 0, :])
+        last_hidden = outputs.hidden_states[-1]
+        pooled = last_hidden[:, 0, :]
+        return self.classifier(pooled)
+
+    def training_step(self, batch, batch_idx):
+        logits = self(batch['input_ids'], batch['attention_mask'])
         loss = torch.nn.functional.cross_entropy(logits, batch['labels'])
-        
         self.train_acc(logits.argmax(dim=1), batch['labels'])
         self.log('train_loss', loss)
         self.log('train_acc', self.train_acc, prog_bar=True)
-        
         if torch.cuda.is_available():
             for gpu in GPUtil.getGPUs():
-                self.log(f"GPU {gpu.id}", gpu.memoryUsed)
-        
+                self.log(f"GPU_{gpu.id}_mem", gpu.memoryUsed)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        outputs = self.model(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
-            output_hidden_states=True
-        )
-        logits = self.classifier(outputs.hidden_states[-1][:, 0, :])
+        logits = self(batch['input_ids'], batch['attention_mask'])
         loss = torch.nn.functional.cross_entropy(logits, batch['labels'])
-        
         self.val_acc(logits.argmax(dim=1), batch['labels'])
         self.val_f1(logits.argmax(dim=1), batch['labels'])
         self.log('val_loss', loss, prog_bar=True)
@@ -158,12 +146,7 @@ class Adapter4VSA(L.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
-        outputs = self.model(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
-            output_hidden_states=True
-        )
-        logits = self.classifier(outputs.hidden_states[-1][:, 0, :])
+        logits = self(batch['input_ids'], batch['attention_mask'])
         self.test_acc(logits.argmax(dim=1), batch['labels'])
         self.test_f1(logits.argmax(dim=1), batch['labels'])
         self.log('test_acc', self.test_acc, prog_bar=True)
@@ -172,42 +155,60 @@ class Adapter4VSA(L.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.AdamW(
-            self.model.parameters(), 
+            list(self.model.parameters()) + list(self.classifier.parameters()),
             lr=self.hparams.lr,
             weight_decay=0.01
         )
 
+
 if __name__ == '__main__':
     args = adapter_parse_args()
-    
-    # Model initialization
+
+    # Map model choice to name
     model_map = {
         1: "vinai/phobert-base-v2",
         2: "vinai/phobert-large"
     }
-    tokenizer = AutoTokenizer.from_pretrained(model_map[args.model])
-    
-    # Set random seed for reproducibility
+    model_name = model_map[args.model]
+
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        use_fast=False,
+        model_max_length=256
+    )
+
+    # Set seeds
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    # Data loading
-    loader = VSFCLoader(tokenizer, batch_size=args.batch_size)
-    train_loader = loader.load_data(subset='train')
-    val_loader = loader.load_data(subset='val')
-    test_loader = loader.load_data(subset='test')
-    
-    # Model setup
+    # Data loading and splitting
+    if args.dataset == 'aivi':
+        texts, labels = load_aivivn('train')
+        texts = [word_tokenize(t, format='text') for t in texts]
+        full_ds = AIVIVNDataset(texts, labels, tokenizer, max_length=256)
+        val_n = int(len(full_ds) * 0.1)
+        tr_n = len(full_ds) - val_n
+        tr_ds, val_ds = random_split(full_ds, [tr_n, val_n])
+        train_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        test_loader  = AIVIVNLoader(tokenizer, batch_size=args.batch_size).load_data('test')
+    else:
+        loader = VSFCLoader(tokenizer, batch_size=args.batch_size)
+        train_loader = loader.load_data('train')
+        val_loader   = loader.load_data('val')
+        test_loader  = loader.load_data('test')
+
+    # Initialize model
     model = Adapter4VSA(
-        model_name=model_map[args.model],
+        model_name=model_name,
         num_labels=3,
         adapter_size=args.adapter_size,
         lr=args.learning_rate
     )
-    
-    # Trainer configuration
-    GPUs = [int(gpu) for gpu in args.gpus.split(',')]
 
+    # Trainer setup
+    GPUs = [int(g) for g in args.gpus.split(',')]
     trainer = L.Trainer(
         strategy="ddp_find_unused_parameters_true",
         max_epochs=args.epochs,
@@ -216,16 +217,12 @@ if __name__ == '__main__':
         callbacks=[EarlyStopping(monitor='val_loss', patience=3)],
         enable_progress_bar=True
     )
-    
-    # Training execution
-    if trainer.is_global_zero:
-        start_time = time.time()
 
+    # Training
+    start_time = time.time()
     trainer.fit(model, train_loader, val_loader)
-
     if trainer.is_global_zero:
-        end_time = time.time()
-        print(f"Training time: {end_time - start_time} seconds")
-    
-    # Final evaluation
+        print(f"Training time: {time.time() - start_time:.2f} seconds")
+
+    # Testing
     trainer.test(model, test_loader)

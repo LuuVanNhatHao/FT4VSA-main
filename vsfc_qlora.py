@@ -14,13 +14,23 @@ from peft import (
     prepare_model_for_kbit_training
 )
 from torchmetrics import Accuracy, F1Score
-from mint.uit_vsfc_helpers import VSFCLoader
 import GPUtil
+from mint.uit_vsfc_helpers import (
+    VSFCLoader,
+    load_aivivn,
+    AIVIVNDataset,
+    AIVIVNLoader
+)
+from underthesea import word_tokenize
+from torch.utils.data import random_split, DataLoader
 
 torch.set_float32_matmul_precision('high')
 
-def lora_parse_args():
-    """Parse command line arguments for QLoRA fine-tuning"""
+
+def qlora_parse_args():
+    """
+    Parse command line arguments for QLoRA fine-tuning
+    """
     parser = argparse.ArgumentParser(
         description="QLoRA Fine-tuning for Vietnamese Sentiment Analysis"
     )
@@ -30,6 +40,13 @@ def lora_parse_args():
         choices=[1, 2, 3, 4],
         required=True,
         help="Model selection: 1=PhoBERT-base-v2, 2=PhoBERT-large, 3=BARTpho, 4=ViT5"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=['uit', 'aivi'],
+        default='uit',
+        help="Dataset to use: 'uit' for UIT-VSFC, 'aivi' for AIVIVN-2019"
     )
     parser.add_argument(
         "--lora_rank",
@@ -50,7 +67,7 @@ def lora_parse_args():
         help="Dropout rate for LoRA layers (default: 0.1)"
     )
     parser.add_argument(
-        "--batch_size", 
+        "--batch_size",
         type=int,
         default=32,
         help="Batch size (default: 32)"
@@ -65,7 +82,7 @@ def lora_parse_args():
         "--gpus",
         type=str,
         default="0",
-        help="Comma-separated list of GPU indices to use, e.g., '0,1,2' (default: '0')"
+        help="Comma-separated list of GPU indices to use"
     )
     parser.add_argument(
         "--learning_rate",
@@ -92,18 +109,17 @@ def get_4bit_config():
     )
 
 
-def get_lora_config(model_name: str):
+def get_lora_config(model_name: str, r: int, alpha: int, dropout: float):
     target_modules_map = {
         'vinai/phobert-base-v2': ["query", "value"],
         'vinai/phobert-large': ["query", "value"],
         'vinai/bartpho-word': ["q_proj", "v_proj"],
-        'VietAI/vit5-large': ["q", "v"] 
+        'VietAI/vit5-large': ["q", "v"]
     }
-    
     return LoraConfig(
-        r=8,
-        lora_alpha=16,
-        lora_dropout=0.1,
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
         bias="none",
         target_modules=target_modules_map[model_name],
         task_type="SEQ_CLS",
@@ -112,28 +128,32 @@ def get_lora_config(model_name: str):
 
 
 class QLoRA4VSA(L.LightningModule):
-    def __init__(self, model_name, num_labels, lr=3e-4):
+    def __init__(self, model_name, num_labels, lr):
         super().__init__()
         self.save_hyperparameters()
-        
-        # 1. Download model with 4-bit quantization
+        # 1. Load with 4bit quant config
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_name,
             num_labels=num_labels,
-            quantization_config=get_4bit_config(),
+            quantization_config=get_4bit_config()
         )
-        
-        # 2. Convert to LoRA model
+        # 2. Prepare for k-bit and apply LoRA
         self.model = prepare_model_for_kbit_training(self.model)
-        self.model = get_peft_model(self.model, get_lora_config(model_name))
-        
+        self.model = get_peft_model(
+            self.model,
+            get_lora_config(
+                model_name,
+                self.hparams.lora_rank,
+                self.hparams.lora_alpha,
+                self.hparams.lora_dropout
+            )
+        )
         # Metrics
         self.train_acc = Accuracy(task="multiclass", num_classes=num_labels)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_labels)
         self.val_f1 = F1Score(task="multiclass", num_classes=num_labels, average='macro')
         self.test_acc = Accuracy(task="multiclass", num_classes=num_labels)
         self.test_f1 = F1Score(task="multiclass", num_classes=num_labels, average='macro')
-        
 
     def forward(self, input_ids, attention_mask, labels=None):
         return self.model(
@@ -150,32 +170,36 @@ class QLoRA4VSA(L.LightningModule):
         )
         loss = outputs.loss
         preds = torch.argmax(outputs.logits, dim=1)
-        
         self.train_acc(preds, batch['labels'])
         self.log('train_loss', loss)
         self.log('train_acc', self.train_acc, prog_bar=True)
-        
         if torch.cuda.is_available():
             for gpu in GPUtil.getGPUs():
-                self.log(f"GPU {gpu.id}", gpu.memoryUsed)
+                self.log(f"GPU_{gpu.id}_mem", gpu.memoryUsed)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        outputs = self(**batch)
+        outputs = self(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch['labels']
+        )
         loss = outputs.loss
         preds = torch.argmax(outputs.logits, dim=1)
-        
         self.val_acc(preds, batch['labels'])
         self.val_f1(preds, batch['labels'])
         self.log('val_loss', loss, prog_bar=True)
         self.log('val_acc', self.val_acc, prog_bar=True)
         self.log('val_f1', self.val_f1, prog_bar=True)
         return loss
-    
+
     def test_step(self, batch, batch_idx):
-        outputs = self(**batch)
+        outputs = self(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch['labels']
+        )
         preds = torch.argmax(outputs.logits, dim=1)
-        
         self.test_acc(preds, batch['labels'])
         self.test_f1(preds, batch['labels'])
         self.log('test_acc', self.test_acc, prog_bar=True)
@@ -184,63 +208,68 @@ class QLoRA4VSA(L.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.AdamW(
-            self.model.parameters(), 
-            lr=self.hparams.lr,
-            weight_decay=0.01
+            self.model.parameters(), lr=self.hparams.learning_rate, weight_decay=0.01
         )
 
-    
-if __name__ == "__main__":
-    args = lora_parse_args()
-    
-    # Model mapping
+
+if __name__ == '__main__':
+    args = qlora_parse_args()
+    # Map model choice to name
     model_map = {
         1: "vinai/phobert-base-v2",
         2: "vinai/phobert-large",
         3: "vinai/bartpho-word",
         4: "VietAI/vit5-large"
     }
-    
-    # Set random seed
+    model_name = model_map[args.model]
+
+    # Set seeds
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    # Donwload tokenizer and data
-    tokenizer = AutoTokenizer.from_pretrained(model_map[args.model])
-    loader = VSFCLoader(tokenizer, batch_size=args.batch_size)
-    train_loader = loader.load_data(subset='train')
-    val_loader = loader.load_data(subset='val')
-    test_loader = loader.load_data(subset='test')
-    
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    # Setup model
+    # Data loading and splitting
+    if args.dataset == 'aivi':
+        texts, labels = load_aivivn('train')
+        texts = [word_tokenize(t, format='text') for t in texts]
+        full_ds = AIVIVNDataset(texts, labels, tokenizer, max_length=128)
+        val_size = int(len(full_ds) * 0.1)
+        train_size = len(full_ds) - val_size
+        train_ds, val_ds = random_split(full_ds, [train_size, val_size])
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        test_loader  = AIVIVNLoader(tokenizer, batch_size=args.batch_size).load_data('test')
+    else:
+        loader = VSFCLoader(tokenizer, batch_size=args.batch_size)
+        train_loader = loader.load_data('train')
+        val_loader   = loader.load_data('val')
+        test_loader  = loader.load_data('test')
+
+    # Model init
     model = QLoRA4VSA(
-        model_name=model_map[args.model],
+        model_name=model_name,
         num_labels=3,
         lr=args.learning_rate
     )
-    
-    # Setup GPUs
-    GPUs = [int(gpu) for gpu in args.gpus.split(',')]
 
-    # Setup trainer
+    # Trainer
+    GPUs = [int(g) for g in args.gpus.split(',')]
+    callbacks = [EarlyStopping(monitor='val_loss', patience=3)]
     trainer = L.Trainer(
         max_epochs=args.epochs,
-        accelerator="gpu",
+        accelerator='gpu',
         devices=GPUs,
-        callbacks=[EarlyStopping(monitor="val_loss", patience=3)],
+        callbacks=callbacks,
         precision="bf16-mixed"
     )
-    
-    # Training
-    if trainer.is_global_zero:
-        start_time = time.time()
 
+    # Train
+    start_time = time.time()
     trainer.fit(model, train_loader, val_loader)
-    
     if trainer.is_global_zero:
-        end_time = time.time()
-        print(f"Training time: {end_time - start_time} seconds")
-    
-    # Evaluation
+        print(f"Training time: {time.time() - start_time:.2f} seconds")
+
+    # Test
     trainer.test(model, test_loader)
