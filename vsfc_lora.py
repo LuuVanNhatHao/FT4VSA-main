@@ -22,9 +22,9 @@ def lora_parse_args():
     parser.add_argument(
         "--model",
         type=int,
-        choices=[1, 2, 3, 4],
+        choices=[1, 2, 3, 4, 5],  # Thêm option 5 cho ViT5-base
         required=True,
-        help="Model selection: 1=PhoBERT-base-v2, 2=PhoBERT-large, 3=BARTpho, 4=ViT5"
+        help="Model selection: 1=PhoBERT-base-v2, 2=PhoBERT-large, 3=BARTpho, 4=ViT5-large, 5=ViT5-base"
     )
     parser.add_argument(
         "--dataset",
@@ -154,19 +154,20 @@ class LoRA4VSA(L.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.AdamW(
-            self.model.parameters(), lr=self.hparams.lr, weight_decay=0.01
+            self.model.parameters(), lr=self.hparams.learning_rate, weight_decay=0.01
         )
 
 
 if __name__ == '__main__':
     args = lora_parse_args()
 
-    # Model mapping
+    # Model mapping including ViT5-base
     model_map = {
         1: "vinai/phobert-base-v2",
         2: "vinai/phobert-large",
         3: "vinai/bartpho-word",
-        4: "VietAI/vit5-large"
+        4: "VietAI/vit5-large",
+        5: "VietAI/vit5-base"  # Thêm ViT5-base
     }
 
     # LoRA target modules
@@ -174,7 +175,8 @@ if __name__ == '__main__':
         1: ["query", "value"],
         2: ["query", "value"],
         3: ["q_proj", "v_proj"],
-        4: ["q", "v"]
+        4: ["q", "v"],
+        5: ["q", "v"]  # dùng giống ViT5-large
     }
 
     # Prepare LoRA config
@@ -209,7 +211,7 @@ if __name__ == '__main__':
         full_ds = AIVIVNDataset(texts, labels, tokenizer, max_length=128)
         val_size = int(len(full_ds) * 0.1)
         train_size = len(full_ds) - val_size
-        train_ds, val_ds = random_split(full_ds, [train_size, val_size])
+        train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=torch.Generator().manual_seed(args.seed))
 
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
