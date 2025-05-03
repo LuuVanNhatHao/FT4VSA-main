@@ -23,9 +23,9 @@ def fft_parse_args():
     parser.add_argument(
         "--model",
         type=int,
-        choices=[1, 2, 3, 4],
+        choices=[1, 2, 3, 4, 5],  # Thêm option 5 cho ViT5-base
         required=True,
-        help="Select model: 1=PhoBERT-base-v2, 2=PhoBERT-large, 3=BARTpho, 4=ViT5"
+        help="Select model: 1=PhoBERT-base-v2, 2=PhoBERT-large, 3=BARTpho, 4=ViT5-large, 5=ViT5-base"
     )
     parser.add_argument(
         "--dataset",
@@ -138,6 +138,8 @@ if __name__ == '__main__':
         model_name = "vinai/bartpho-word"
     elif args.model == 4:
         model_name = "VietAI/vit5-large"
+    elif args.model == 5:
+        model_name = "VietAI/vit5-base"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -147,15 +149,30 @@ if __name__ == '__main__':
 
     # Data loading
     if args.dataset == 'aivi':
-        # Load full train set and split for validation
         texts, labels = load_aivivn('train')
         texts = [word_tokenize(t, format='text') for t in texts]
         full_ds = AIVIVNDataset(texts, labels, tokenizer, max_length=128)
         n_val = int(len(full_ds) * 0.1)
         n_train = len(full_ds) - n_val
-        train_ds, val_ds = random_split(full_ds, [n_train, n_val])
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        train_ds, val_ds = random_split(
+            full_ds,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(args.seed)
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
+        )
         test_loader = AIVIVNLoader(tokenizer, batch_size=args.batch_size).load_data('test')
     else:
         loader = VSFCLoader(tokenizer, batch_size=args.batch_size)
@@ -164,12 +181,17 @@ if __name__ == '__main__':
         test_loader = loader.load_data(subset='test')
 
     # Initialize model
-    model = FFT4VSA(model_name=model_name, num_labels=3, lr=args.learning_rate)
+    model = FFT4VSA(
+        model_name=model_name,
+        num_labels=3,
+        lr=args.learning_rate
+    )
+
     print('\n\n')
 
     # Trainer setup
     GPUs = [int(g) for g in args.gpus.split(',')]
-    callbacks = [EarlyStopping(monitor='val_loss', patience=3)] if 'val_loader' in locals() else []
+    callbacks = [EarlyStopping(monitor='val_loss', patience=3)]
     trainer = L.Trainer(
         max_epochs=args.epochs,
         accelerator='gpu',
@@ -179,10 +201,7 @@ if __name__ == '__main__':
 
     # Train
     start_time = time.time()
-    if 'val_loader' in locals():
-        trainer.fit(model, train_loader, val_loader)
-    else:
-        trainer.fit(model, train_loader)
+    trainer.fit(model, train_loader, val_loader)
     if trainer.is_global_zero:
         print(f"Training time: {time.time() - start_time:.2f} seconds")
 
