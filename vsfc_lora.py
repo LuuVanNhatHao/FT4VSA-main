@@ -153,8 +153,9 @@ class LoRA4VSA(L.LightningModule):
         return {'test_acc': self.test_acc, 'test_f1': self.test_f1}
 
     def configure_optimizers(self):
+        # Sửa attribute: sử dụng self.hparams.lr thay vì self.hparams.learning_rate
         return torch.optim.AdamW(
-            self.model.parameters(), lr=self.hparams.learning_rate, weight_decay=0.01
+            self.model.parameters(), lr=self.hparams.lr, weight_decay=0.01
         )
 
 
